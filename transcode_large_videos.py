@@ -180,12 +180,16 @@ def _build_cmd(inp: Path, outp: Path, codec: str, crf: int, preset: str, a_codec
                     "hevc_nvenc",
                     "-preset",
                     preset,
+                    "-tune",
+                    "hq",
                     "-rc",
-                    "vbr_hq",
+                    "vbr",
                     "-cq",
                     str(crf),
                     "-b:v",
                     "0",
+                    "-multipass",
+                    "fullres",
                 ]
             elif backend == "qsv":
                 cmd += [
@@ -228,12 +232,16 @@ def _build_cmd(inp: Path, outp: Path, codec: str, crf: int, preset: str, a_codec
                     "h264_nvenc",
                     "-preset",
                     preset,
+                    "-tune",
+                    "hq",
                     "-rc",
-                    "vbr_hq",
+                    "vbr",
                     "-cq",
                     str(crf),
                     "-b:v",
                     "0",
+                    "-multipass",
+                    "fullres",
                 ]
             elif backend == "qsv":
                 cmd += [
