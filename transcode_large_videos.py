@@ -483,8 +483,8 @@ def main():
                 est_total_count += 1
             continue
         out_ext = "." + (args.container if args.container else ("mp4" if p.suffix.lower() in (".mp4", ".m4v") else "mkv"))
-        final_path = p.with_suffix(out_ext)
-        tmp_path = p.with_name(p.stem + ".transcoded" + out_ext)
+        final_path = p.with_name(p.stem + ".transcoded" + out_ext)
+        tmp_path = p.with_name(p.stem + ".transcoding" + out_ext)
         if tmp_path.exists():
             try:
                 tmp_path.unlink()
