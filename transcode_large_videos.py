@@ -299,7 +299,7 @@ def _build_cmd(inp: Path, outp: Path, codec: str, crf: int, preset: str, a_codec
     return cmd
 
 
-def main():
+def main(): 
     parser = argparse.ArgumentParser()
     parser.add_argument("path", help="target directory to scan")
     parser.add_argument("--min-size", default="1GB")
@@ -321,7 +321,9 @@ def main():
     parser.add_argument("--bitrate-only", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--report-format", choices=["text", "csv", "json"], default="text")
-    parser.add_argument("--report-file", default=None)
+    parser.add_argument("--report-file", action="store_true")
+    parser.add_argument("--confirm-delete", action="store_true")
+    parser.add_argument("--report-dir", default=None)
     parser.add_argument("--est-mode", choices=["ratio", "target"], default="ratio")
     parser.add_argument("--est-ratio", type=float, default=None)
     parser.add_argument("--est-target-v-bitrate", default=None)
@@ -353,6 +355,7 @@ def main():
 
     exts = _exts_list(args.extensions)
     root = Path(args.path)
+    report_dir = Path(args.report_dir) if args.report_dir else Path.cwd()
     if not root.exists() or not root.is_dir():
         print("path is not a directory", file=sys.stderr)
         sys.exit(2)
@@ -554,8 +557,17 @@ def main():
                     "output_size_bytes": int(new_size),
                 })
             continue
+        effect_no_delete = args.no_delete
+        if not effect_no_delete and args.confirm_delete:
+            try:
+                resp = input(f"Delete original file '{p}'? Type 'y' to confirm: ").strip().lower()
+            except Exception:
+                resp = ""
+            if resp != "y":
+                effect_no_delete = True
+
         target_path = final_path
-        if args.no_delete:
+        if effect_no_delete:
             if target_path == p:
                 target_path = _unique_path(p.with_name(p.stem + ".transcoded" + out_ext))
             elif target_path.exists():
@@ -565,7 +577,7 @@ def main():
                 target_path = _unique_path(target_path)
         if args.verbose:
             print(f"Target path: {target_path}")
-        if not args.no_delete and p.exists():
+        if not effect_no_delete and p.exists():
             try:
                 p.unlink()
             except OSError:
@@ -609,10 +621,13 @@ def main():
             data = records
             if args.report_file:
                 try:
-                    Path(args.report_file).parent.mkdir(parents=True, exist_ok=True)
-                    with open(args.report_file, "w", encoding="utf-8") as f:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    report_dir.mkdir(parents=True, exist_ok=True)
+                    report_path = report_dir / f"transcode_report_{ts}.json"
+                    report_path = _unique_path(report_path)
+                    with open(report_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2)
-                    print(f"Report written to {args.report_file}")
+                    print(f"Report written to {report_path}")
                 except Exception as e:
                     print(f"Failed to write report: {e}")
             else:
@@ -636,15 +651,18 @@ def main():
             ]
             if args.report_file:
                 try:
-                    Path(args.report_file).parent.mkdir(parents=True, exist_ok=True)
-                    with open(args.report_file, "w", newline="", encoding="utf-8") as f:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    report_dir.mkdir(parents=True, exist_ok=True)
+                    report_path = report_dir / f"transcode_report_{ts}.csv"
+                    report_path = _unique_path(report_path)
+                    with open(report_path, "w", newline="", encoding="utf-8") as f:
                         w = csv.DictWriter(f, fieldnames=fieldnames)
                         w.writeheader()
                         for r in records:
                             # ensure all keys present
                             row = {k: r.get(k) for k in fieldnames}
                             w.writerow(row)
-                    print(f"Report written to {args.report_file}")
+                    print(f"Report written to {report_path}")
                 except Exception as e:
                     print(f"Failed to write report: {e}")
             else:
@@ -665,6 +683,22 @@ def main():
                 # append a CSV-like summary line to stdout only when not writing to file
                 if not args.report_file and args.report_format == "csv":
                     print(f"summary,,,,,,,{''},{''},{''},{''},{est_total_saved_bytes},{''}")
+    elif args.report_format == "text" and args.report_file:
+        try:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_path = report_dir / f"transcode_report_{ts}.txt"
+            report_path = _unique_path(report_path)
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(f"Files scanned: {total}\n")
+                f.write(f"Processed: {processed}\n")
+                f.write(f"Skipped: {skipped}\n")
+                f.write(f"Total saved: {_human(saved_bytes)}\n")
+                if args.dry_run:
+                    f.write(f"Estimated total savings (would transcode): {_human(est_total_saved_bytes)} across {est_total_count} files\n")
+            print(f"Report written to {report_path}")
+        except Exception as e:
+            print(f"Failed to write report: {e}")
 
 
 if __name__ == "__main__":
