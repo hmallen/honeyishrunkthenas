@@ -152,12 +152,16 @@ def _choose_gpu_backend(cpu_codec: str, gpu: str):
     return gpu
 
 
-def _build_cmd(inp: Path, outp: Path, codec: str, crf: int, preset: str, a_codec: str, a_bitrate: str, container: str, gpu: str) -> list:
+def _build_cmd(inp: Path, outp: Path, codec: str, crf: int, preset: str, a_codec: str, a_bitrate: str, container: str, gpu: str, verbose: bool) -> list:
     cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel",
-        "error",
+    ]
+    if verbose:
+        cmd += ["-loglevel", "info", "-stats"]
+    else:
+        cmd += ["-loglevel", "error"]
+    cmd += [
         "-y",
         "-i",
         str(inp),
@@ -315,6 +319,7 @@ def main():
     parser.add_argument("--print-bitrate", action="store_true")
     parser.add_argument("--max-transcodes", type=int, default=None)
     parser.add_argument("--bitrate-only", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--report-format", choices=["text", "csv", "json"], default="text")
     parser.add_argument("--report-file", default=None)
     parser.add_argument("--est-mode", choices=["ratio", "target"], default="ratio")
@@ -408,6 +413,11 @@ def main():
                 est_out = int(total_bps * dur / 8.0)
         if est_out is not None:
             est_saved = int(orig_size - est_out)
+        if args.verbose:
+            lbl = _human_bitrate(bps) if bps is not None else "unknown"
+            est_out_lbl = _human(est_out) if est_out is not None else "unknown"
+            est_saved_lbl = _human(est_saved) if est_saved is not None else "unknown"
+            print(f"[info] {p} duration={dur:.1f}s bitrate={lbl} est_out={est_out_lbl} est_saved={est_saved_lbl}")
         skip_reason = None
         if min_bps is not None:
             if bps is not None:
@@ -469,8 +479,10 @@ def main():
                 tmp_path.unlink()
             except OSError:
                 tmp_path = _unique_path(tmp_path)
-        cmd = _build_cmd(p, tmp_path, args.codec, crf, args.preset, args.audio_codec, args.audio_bitrate, out_ext.lstrip("."), args.gpu)
+        cmd = _build_cmd(p, tmp_path, args.codec, crf, args.preset, args.audio_codec, args.audio_bitrate, out_ext.lstrip("."), args.gpu, args.verbose)
         print(f"Transcoding {p} -> {tmp_path}")
+        if args.verbose and not args.dry_run:
+            print("ffmpeg cmd: " + " ".join(cmd))
         if args.dry_run:
             print("dry-run")
             skipped += 1
@@ -489,9 +501,14 @@ def main():
                 })
             continue
         t0 = time.time()
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if args.verbose:
+            proc = subprocess.Popen(cmd)
+            ret_code = proc.wait()
+        else:
+            proc_run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            ret_code = proc_run.returncode
         dt = time.time() - t0
-        if proc.returncode != 0:
+        if ret_code != 0:
             print(f"ffmpeg failed for {p}")
             if tmp_path.exists():
                 try:
@@ -538,8 +555,16 @@ def main():
                 })
             continue
         target_path = final_path
-        if target_path.exists() and target_path != p:
-            target_path = _unique_path(target_path)
+        if args.no_delete:
+            if target_path == p:
+                target_path = _unique_path(p.with_name(p.stem + ".transcoded" + out_ext))
+            elif target_path.exists():
+                target_path = _unique_path(target_path)
+        else:
+            if target_path.exists() and target_path != p:
+                target_path = _unique_path(target_path)
+        if args.verbose:
+            print(f"Target path: {target_path}")
         if not args.no_delete and p.exists():
             try:
                 p.unlink()
@@ -592,7 +617,7 @@ def main():
                     print(f"Failed to write report: {e}")
             else:
                 print(json.dumps(data, indent=2))
-        else:  # csv
+        else:  # csv 
             fieldnames = [
                 "path",
                 "size_bytes",
