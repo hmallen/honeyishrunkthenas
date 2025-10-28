@@ -389,6 +389,8 @@ def main():
             continue
         if p.suffix.lower().lstrip(".") not in exts:
             continue
+        if "transcoded" in p.name.lower():
+            continue
         try:
             orig_size = p.stat().st_size
         except OSError:
