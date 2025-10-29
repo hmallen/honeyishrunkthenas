@@ -389,7 +389,8 @@ def main():
             continue
         if p.suffix.lower().lstrip(".") not in exts:
             continue
-        if "transcoded" in p.name.lower():
+        name_lower = p.name.lower()
+        if ("transcoded" in name_lower) or ("transcoding" in name_lower):
             continue
         try:
             orig_size = p.stat().st_size
