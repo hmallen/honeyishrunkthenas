@@ -568,7 +568,17 @@ def main():
                     "output_size_bytes": int(new_size),
                 })
             continue
-        effect_no_delete = args.no_delete
+        # Verify durations match before deciding deletion
+        orig_dur_check = _ffprobe_duration(p)
+        out_dur_check = _ffprobe_duration(tmp_path)
+        durations_match = (orig_dur_check > 0 and out_dur_check > 0 and abs(orig_dur_check - out_dur_check) <= 0.5)
+        if not durations_match:
+            try:
+                print(f"Duration mismatch; keeping original: {p} orig={orig_dur_check:.3f}s new={out_dur_check:.3f}s")
+            except Exception:
+                print("Duration mismatch; keeping original")
+
+        effect_no_delete = args.no_delete or (not durations_match)
         if not effect_no_delete and args.confirm_delete:
             try:
                 resp = input(f"Delete original file '{p}'? Type 'y' to confirm: ").strip().lower()
@@ -616,6 +626,7 @@ def main():
                 "saved_bytes": int(saved),
                 "output_path": str(target_path),
                 "output_size_bytes": int(out_sz),
+                "reason": ("duration_mismatch" if not durations_match else None),
             })
 
     print(f"Files scanned: {total}")
