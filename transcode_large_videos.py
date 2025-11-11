@@ -88,6 +88,36 @@ def _ffprobe_duration(p: Path) -> float:
         return 0.0
 
 
+def _parse_ff_time(v: str) -> float:
+    v = v.strip()
+    if not v:
+        return 0.0
+    if ":" in v:
+        parts = v.split(":")
+        if len(parts) == 3:
+            h = float(parts[0])
+            m = float(parts[1])
+            s = float(parts[2])
+            return h * 3600.0 + m * 60.0 + s
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _fmt_time(secs: float) -> str:
+    try:
+        s = int(max(0, round(secs)))
+    except Exception:
+        s = 0
+    h = s // 3600
+    m = (s % 3600) // 60
+    ss = s % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{ss:02d}"
+    return f"{m}:{ss:02d}"
+
+
 def _exts_list(s: str) -> set:
     parts = [p.strip().lower().lstrip(".") for p in s.split(",") if p.strip()]
     return set(parts)
@@ -169,6 +199,8 @@ def _build_cmd(inp: Path, outp: Path, codec: str, crf: int, preset: str, a_codec
         str(inp),
         "-map",
         "0",
+        "-progress",
+        "pipe:1",
     ]
 
     backend = _choose_gpu_backend(codec, gpu)
@@ -717,13 +749,69 @@ def main():
                 records.append(_rec)
                 _write_record(_rec)
             continue
+        if dur <= 0:
+            dur = _ffprobe_duration(p)
         t0 = time.time()
-        if args.verbose:
-            proc = subprocess.Popen(cmd)
-            ret_code = proc.wait()
-        else:
-            proc_run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            ret_code = proc_run.returncode
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        out_time_s = 0.0
+        speed_x = None
+        last_print = 0.0
+        try:
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    line = (raw or "").strip()
+                    if not line:
+                        continue
+                    if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                        try:
+                            key, val = line.split("=", 1)
+                            num = float(val)
+                            if key.endswith("_us"):
+                                out_time_s = num / 1_000_000.0
+                            elif key.endswith("_ms"):
+                                out_time_s = num / 1_000.0
+                        except Exception:
+                            pass
+                    elif line.startswith("out_time="):
+                        try:
+                            _, val = line.split("=", 1)
+                            out_time_s = _parse_ff_time(val)
+                        except Exception:
+                            pass
+                    elif line.startswith("speed="):
+                        try:
+                            _, val = line.split("=", 1)
+                            val = val.strip().rstrip("x")
+                            speed_x = float(val) if val else None
+                        except Exception:
+                            pass
+                    elif line.startswith("progress="):
+                        # fall through to print on each progress update
+                        pass
+
+                    now = time.time()
+                    if now - last_print >= 2.0:
+                        last_print = now
+                        pct = (out_time_s / dur * 100.0) if (dur and dur > 0) else 0.0
+                        eta = None
+                        if (dur and dur > 0) and speed_x and speed_x > 0:
+                            rem_media = max(0.0, dur - out_time_s)
+                            eta = rem_media / speed_x
+                        eta_lbl = _fmt_time(eta) if eta is not None else "unknown"
+                        print(f"  progress: {pct:5.1f}%  ETA {eta_lbl}  speed {speed_x:.2f}x" if speed_x else f"  progress: {pct:5.1f}%  ETA {eta_lbl}")
+        finally:
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+        ret_code = proc.wait()
         dt = time.time() - t0
         if ret_code != 0:
             print(f"ffmpeg failed for {p}")
