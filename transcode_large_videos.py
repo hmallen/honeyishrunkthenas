@@ -7,6 +7,8 @@ import sys
 import time
 import json
 import csv
+import signal
+import atexit
 from pathlib import Path
 
 
@@ -320,6 +322,7 @@ def main():
     parser.add_argument("--container", choices=["mkv", "mp4"], default="mkv")
     parser.add_argument("--gpu", choices=["none", "auto", "nvenc", "qsv", "amf"], default="auto")
     parser.add_argument("--extensions", default="mp4,mkv,avi,mov,m4v,mpg,mpeg,ts,m2ts,webm,wmv,flv")
+    parser.add_argument("--largest-first", action="store_true")
     parser.add_argument("--min-saving", type=float, default=5.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-delete", action="store_true")
@@ -332,6 +335,7 @@ def main():
     parser.add_argument("--report-file", action="store_true")
     parser.add_argument("--confirm-delete", action="store_true")
     parser.add_argument("--report-dir", default=None)
+    parser.add_argument("--use-history", action="store_true")
     parser.add_argument("--est-mode", choices=["ratio", "target"], default="ratio")
     parser.add_argument("--est-ratio", type=float, default=None)
     parser.add_argument("--est-target-v-bitrate", default=None)
@@ -368,6 +372,112 @@ def main():
         print("path is not a directory", file=sys.stderr)
         sys.exit(2)
 
+    streaming = args.report_file and (args.report_format in ("csv", "json"))
+    fieldnames = [
+        "path",
+        "size_bytes",
+        "duration_sec",
+        "bitrate_bps",
+        "action",
+        "reason",
+        "time_sec",
+        "saved_bytes",
+        "output_path",
+        "output_size_bytes",
+        "estimated_output_size_bytes",
+        "estimated_saved_bytes",
+        "estimated_total_saved_bytes",
+        "would_transcode",
+    ]
+    report_path = None
+    csv_file = None
+    csv_writer = None
+    json_file = None
+    json_first = True
+    _cleanup_done = False
+
+    def _open_report():
+        nonlocal report_path, csv_file, csv_writer, json_file, json_first
+        if not streaming:
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        if args.report_format == "csv":
+            report_path = _unique_path(report_dir / f"transcode_report_{ts}.csv")
+            csv_file = open(report_path, "w", newline="", encoding="utf-8")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_file.flush()
+        else:
+            report_path = _unique_path(report_dir / f"transcode_report_{ts}.json")
+            json_file = open(report_path, "w", encoding="utf-8")
+            json_file.write("[\n")
+            json_first = True
+            json_file.flush()
+        print(f"Report file: {report_path}")
+
+    def _write_record(rec: dict):
+        if not streaming:
+            return
+        try:
+            if csv_writer:
+                row = {k: rec.get(k) for k in fieldnames}
+                csv_writer.writerow(row)
+                csv_file.flush()
+            elif json_file:
+                nonlocal json_first
+                if not json_first:
+                    json_file.write(",\n")
+                else:
+                    json_first = False
+                json_file.write(json.dumps(rec))
+                json_file.flush()
+        except Exception:
+            pass
+
+    def _close_report():
+        nonlocal _cleanup_done
+        if _cleanup_done:
+            return
+        _cleanup_done = True
+        try:
+            if json_file:
+                try:
+                    json_file.write("\n]\n")
+                    json_file.flush()
+                except Exception:
+                    pass
+            if csv_file:
+                try:
+                    csv_file.flush()
+                except Exception:
+                    pass
+        finally:
+            try:
+                if json_file:
+                    json_file.close()
+            except Exception:
+                pass
+            try:
+                if csv_file:
+                    csv_file.close()
+            except Exception:
+                pass
+        if report_path:
+            print(f"Report written to {report_path}")
+
+    if streaming:
+        atexit.register(_close_report)
+        try:
+            signal.signal(signal.SIGINT, lambda s, f: (_close_report(), sys.exit(130)))
+        except Exception:
+            pass
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: (_close_report(), sys.exit(143)))
+        except Exception:
+            pass
+        _open_report()
+
     crf = args.crf
     if crf is None:
         crf = 28 if args.codec == "libx265" else 23
@@ -381,7 +491,76 @@ def main():
     est_total_count = 0
     records = []
 
-    for p in root.rglob("*"):
+    history_paths = set()
+    if args.use_history:
+        try:
+            for f in report_dir.glob("transcode_report_*.csv"):
+                try:
+                    with open(f, newline="", encoding="utf-8") as cf:
+                        rows = list(csv.DictReader(cf))
+                    actions = { (row.get("action") or "").strip().lower() for row in rows if row }
+                    if actions and actions.issubset({"dry_run", "summary", ""}):
+                        continue
+                    for r in rows:
+                        if not r:
+                            continue
+                        act = (r.get("action") or "").strip().lower()
+                        if act != "skipped":
+                            continue
+                        pth = r.get("path")
+                        if not pth:
+                            continue
+                        history_paths.add(str(Path(pth)).lower())
+                except Exception:
+                    pass
+            for f in report_dir.glob("transcode_report_*.json"):
+                try:
+                    with open(f, encoding="utf-8") as jf:
+                        data = json.load(jf)
+                    if not isinstance(data, list):
+                        continue
+                    actions = set()
+                    for r in data:
+                        if isinstance(r, dict):
+                            actions.add(str(r.get("action", "")).lower())
+                    if actions and actions.issubset({"dry_run", "summary", ""}):
+                        continue
+                    for r in data:
+                        if not isinstance(r, dict):
+                            continue
+                        act = str(r.get("action", "")).lower()
+                        if act != "skipped":
+                            continue
+                        pth = r.get("path")
+                        if not pth:
+                            continue
+                        history_paths.add(str(Path(pth)).lower())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if args.largest_first:
+        pairs = []
+        for _p in root.rglob("*"):
+            if not _p.is_file():
+                continue
+            if _p.suffix.lower().lstrip(".") not in exts:
+                continue
+            _name_lower = _p.name.lower()
+            if ("transcoded" in _name_lower) or ("transcoding" in _name_lower):
+                continue
+            try:
+                _sz = _p.stat().st_size
+            except OSError:
+                continue
+            pairs.append((_sz, _p))
+        pairs.sort(key=lambda t: t[0], reverse=True)
+        iter_paths = [pp for _, pp in pairs]
+    else:
+        iter_paths = root.rglob("*")
+
+    for p in iter_paths:
         if args.max_transcodes is not None and processed >= args.max_transcodes:
             print("Reached max transcodes; stopping.")
             break
@@ -396,6 +575,24 @@ def main():
             orig_size = p.stat().st_size
         except OSError:
             continue
+        if args.use_history:
+            key = str(p).lower()
+            if key in history_paths:
+                skipped += 1
+                total += 1
+                if args.report_format in ("csv", "json"):
+                    _rec = {
+                        "path": str(p),
+                        "size_bytes": int(orig_size),
+                        "duration_sec": None,
+                        "bitrate_bps": None,
+                        "action": "skipped",
+                        "reason": "history",
+                        "would_transcode": False,
+                    }
+                    records.append(_rec)
+                    _write_record(_rec)
+                continue
         total += 1
         dur = 0.0
         bps = None
@@ -453,7 +650,7 @@ def main():
                 print(f"DRY-RUN: skip {p} reason={skip_reason} bitrate={lbl} est_out={est_out_lbl} est_saved={est_saved_lbl}")
             skipped += 1
             if args.report_format in ("csv", "json"):
-                records.append({
+                _rec = {
                     "path": str(p),
                     "size_bytes": int(orig_size),
                     "duration_sec": float(dur) if dur else None,
@@ -463,7 +660,9 @@ def main():
                     "estimated_output_size_bytes": int(est_out) if est_out is not None else None,
                     "estimated_saved_bytes": int(est_saved) if est_saved is not None else None,
                     "would_transcode": False,
-                })
+                }
+                records.append(_rec)
+                _write_record(_rec)
             continue
         if args.dry_run:
             lbl = _human_bitrate(bps) if bps is not None else "unknown"
@@ -471,7 +670,7 @@ def main():
             est_saved_lbl = _human(est_saved) if est_saved is not None else "unknown"
             print(f"DRY-RUN: would transcode {p} bitrate={lbl} est_out={est_out_lbl} est_saved={est_saved_lbl}")
             if args.report_format in ("csv", "json"):
-                records.append({
+                _rec = {
                     "path": str(p),
                     "size_bytes": int(orig_size),
                     "duration_sec": float(dur) if dur else None,
@@ -480,7 +679,9 @@ def main():
                     "estimated_output_size_bytes": int(est_out) if est_out is not None else None,
                     "estimated_saved_bytes": int(est_saved) if est_saved is not None else None,
                     "would_transcode": True,
-                })
+                }
+                records.append(_rec)
+                _write_record(_rec)
             if est_saved is not None and est_saved > 0:
                 est_total_saved_bytes += est_saved
                 est_total_count += 1
@@ -506,13 +707,15 @@ def main():
                 except OSError:
                     pass
             if args.report_format in ("csv", "json"):
-                records.append({
+                _rec = {
                     "path": str(p),
                     "size_bytes": int(orig_size),
                     "duration_sec": float(dur) if dur else None,
                     "bitrate_bps": float(bps) if bps is not None else None,
                     "action": "dry_run",
-                })
+                }
+                records.append(_rec)
+                _write_record(_rec)
             continue
         t0 = time.time()
         if args.verbose:
@@ -530,7 +733,7 @@ def main():
                 except OSError:
                     pass
             if args.report_format in ("csv", "json"):
-                records.append({
+                _rec = {
                     "path": str(p),
                     "size_bytes": int(orig_size),
                     "duration_sec": float(dur) if dur else None,
@@ -538,7 +741,9 @@ def main():
                     "action": "failed",
                     "reason": "ffmpeg_error",
                     "time_sec": round(dt, 3),
-                })
+                }
+                records.append(_rec)
+                _write_record(_rec)
             continue
         try:
             new_size = tmp_path.stat().st_size
@@ -557,7 +762,7 @@ def main():
                 pass
             skipped += 1
             if args.report_format in ("csv", "json"):
-                records.append({
+                _rec = {
                     "path": str(p),
                     "size_bytes": int(orig_size),
                     "duration_sec": float(dur) if dur else None,
@@ -566,7 +771,9 @@ def main():
                     "reason": "insufficient_saving",
                     "time_sec": round(dt, 3),
                     "output_size_bytes": int(new_size),
-                })
+                }
+                records.append(_rec)
+                _write_record(_rec)
             continue
         # Verify durations match before deciding deletion
         orig_dur_check = _ffprobe_duration(p)
@@ -616,7 +823,7 @@ def main():
         print(f"Done: {p.name} -> {_human(saved)} saved in {dt:.1f}s")
         if args.report_format in ("csv", "json"):
             out_sz = (target_path.stat().st_size if target_path.exists() else new_size)
-            records.append({
+            _rec = {
                 "path": str(p),
                 "size_bytes": int(orig_size),
                 "duration_sec": float(dur) if dur else None,
@@ -627,7 +834,9 @@ def main():
                 "output_path": str(target_path),
                 "output_size_bytes": int(out_sz),
                 "reason": ("duration_mismatch" if not durations_match else None),
-            })
+            }
+            records.append(_rec)
+            _write_record(_rec)
 
     print(f"Files scanned: {total}")
     print(f"Processed: {processed}")
@@ -639,55 +848,13 @@ def main():
 
     # Reporting
     if args.report_format in ("csv", "json"):
-        if args.report_format == "json":
-            data = records
-            if args.report_file:
-                try:
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    report_dir.mkdir(parents=True, exist_ok=True)
-                    report_path = report_dir / f"transcode_report_{ts}.json"
-                    report_path = _unique_path(report_path)
-                    with open(report_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2)
-                    print(f"Report written to {report_path}")
-                except Exception as e:
-                    print(f"Failed to write report: {e}")
-            else:
+        if args.report_file:
+            pass
+        else:
+            if args.report_format == "json":
+                data = records
                 print(json.dumps(data, indent=2))
-        else:  # csv 
-            fieldnames = [
-                "path",
-                "size_bytes",
-                "duration_sec",
-                "bitrate_bps",
-                "action",
-                "reason",
-                "time_sec",
-                "saved_bytes",
-                "output_path",
-                "output_size_bytes",
-                "estimated_output_size_bytes",
-                "estimated_saved_bytes",
-                "estimated_total_saved_bytes",
-                "would_transcode",
-            ]
-            if args.report_file:
-                try:
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    report_dir.mkdir(parents=True, exist_ok=True)
-                    report_path = report_dir / f"transcode_report_{ts}.csv"
-                    report_path = _unique_path(report_path)
-                    with open(report_path, "w", newline="", encoding="utf-8") as f:
-                        w = csv.DictWriter(f, fieldnames=fieldnames)
-                        w.writeheader()
-                        for r in records:
-                            # ensure all keys present
-                            row = {k: r.get(k) for k in fieldnames}
-                            w.writerow(row)
-                    print(f"Report written to {report_path}")
-                except Exception as e:
-                    print(f"Failed to write report: {e}")
-            else:
+            else:  # csv
                 w = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
                 w.writeheader()
                 for r in records:
@@ -695,7 +862,7 @@ def main():
                     w.writerow(row)
         if args.dry_run:
             if args.report_format == "json":
-                # print summary to stdout in addition to the JSON file/printout
+                # print summary to stdout in addition to the JSON printout
                 print(json.dumps({
                     "action": "summary",
                     "estimated_total_saved_bytes": int(est_total_saved_bytes),
